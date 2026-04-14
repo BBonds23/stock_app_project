@@ -15,7 +15,9 @@ from scipy.stats import jarque_bera, kurtosis, norm, probplot, skew
 # ------------------------------------------------------------
 st.set_page_config(page_title="Stock Comparison & Analysis App", layout="wide")
 st.title("Stock Comparison & Analysis App")
-st.caption("Compare 2–5 stocks, benchmark them against the S&P 500, and explore diversification with a two-asset portfolio.")
+st.caption(
+    "Compare 2–5 stocks, benchmark them against the S&P 500, and explore diversification with a two-asset portfolio."
+)
 
 TRADING_DAYS = 252
 BENCHMARK = "^GSPC"
@@ -48,6 +50,7 @@ def download_single_ticker(ticker: str, start_date: date, end_date: date) -> pd.
         end=end_date + timedelta(days=1),
         auto_adjust=False,
         progress=False,
+        threads=False,
     )
     df = flatten_columns(df)
     return df
@@ -59,6 +62,9 @@ def download_price_data(tickers: tuple[str, ...], start_date: date, end_date: da
     failed = []
     partial = []
 
+    # Allow a small buffer so weekends / market-close timing do not falsely trigger warnings
+    latest_expected = end_date - timedelta(days=3)
+
     for ticker in list(tickers) + [BENCHMARK]:
         try:
             df = download_single_ticker(ticker, start_date, end_date)
@@ -66,16 +72,27 @@ def download_price_data(tickers: tuple[str, ...], start_date: date, end_date: da
             failed.append(ticker)
             continue
 
-        if df.empty or "Adj Close" not in df.columns:
+        if df.empty:
             failed.append(ticker)
             continue
 
-        series = df["Adj Close"].copy().dropna()
+        price_col = None
+        if "Adj Close" in df.columns:
+            price_col = "Adj Close"
+        elif "Close" in df.columns:
+            price_col = "Close"
+
+        if price_col is None:
+            failed.append(ticker)
+            continue
+
+        series = df[price_col].copy().dropna()
+
         if series.empty:
             failed.append(ticker)
             continue
 
-        if series.index.min().date() > start_date or series.index.max().date() < end_date:
+        if series.index.min().date() > start_date or series.index.max().date() < latest_expected:
             partial.append(ticker)
 
         all_prices[ticker] = series
@@ -117,7 +134,7 @@ def align_selected_data(price_dict: dict[str, pd.Series], selected_tickers: list
         stock_returns = all_returns[selected_tickers]
         benchmark_returns = all_returns[[BENCHMARK]]
 
-    return stock_prices, benchmark_prices, stock_returns.join(benchmark_returns, how="inner") if benchmark_returns is not None else stock_returns
+    return stock_prices, benchmark_prices, all_returns
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -147,7 +164,11 @@ def make_price_chart(price_df: pd.DataFrame, selected_series: list[str]) -> go.F
     return fig
 
 
-def make_wealth_index(stock_returns: pd.DataFrame, benchmark_returns: pd.DataFrame | None, initial_value: int = 10000) -> pd.DataFrame:
+def make_wealth_index(
+    stock_returns: pd.DataFrame,
+    benchmark_returns: pd.DataFrame | None,
+    initial_value: int = 10000,
+) -> pd.DataFrame:
     wealth = (1 + stock_returns).cumprod() * initial_value
     wealth["Equal-Weight Portfolio"] = (1 + stock_returns.mean(axis=1)).cumprod() * initial_value
     if benchmark_returns is not None and not benchmark_returns.empty:
@@ -232,9 +253,19 @@ def make_qq_plot(series: pd.Series, ticker: str) -> go.Figure:
 
 
 def make_box_plot(stock_returns: pd.DataFrame) -> go.Figure:
-    long_df = stock_returns.reset_index().melt(id_vars=stock_returns.index.name or "Date", var_name="Ticker", value_name="Daily Return")
+    idx_name = stock_returns.index.name if stock_returns.index.name else "Date"
+    long_df = stock_returns.reset_index().melt(
+        id_vars=idx_name,
+        var_name="Ticker",
+        value_name="Daily Return",
+    )
     fig = px.box(long_df, x="Ticker", y="Daily Return", title="Box Plot of Daily Returns")
-    fig.update_layout(template="plotly_white", xaxis_title="Ticker", yaxis_title="Daily Return", height=500)
+    fig.update_layout(
+        template="plotly_white",
+        xaxis_title="Ticker",
+        yaxis_title="Daily Return",
+        height=500,
+    )
     return fig
 
 
@@ -258,9 +289,14 @@ def make_scatter_plot(stock_returns: pd.DataFrame, stock_a: str, stock_b: str) -
         stock_returns,
         x=stock_a,
         y=stock_b,
-                title=f"Daily Return Scatter Plot: {stock_a} vs {stock_b}",
+        title=f"Daily Return Scatter Plot: {stock_a} vs {stock_b}",
     )
-    fig.update_layout(template="plotly_white", xaxis_title=f"{stock_a} Daily Return", yaxis_title=f"{stock_b} Daily Return", height=500)
+    fig.update_layout(
+        template="plotly_white",
+        xaxis_title=f"{stock_a} Daily Return",
+        yaxis_title=f"{stock_b} Daily Return",
+        height=500,
+    )
     return fig
 
 
@@ -290,7 +326,7 @@ def build_two_asset_portfolio(stock_returns: pd.DataFrame, stock_a: str, stock_b
     for w in weights:
         portfolio_return = w * mean_returns_annual[stock_a] + (1 - w) * mean_returns_annual[stock_b]
         variance = (
-            (w ** 2) * cov_annual.loc[stock_a, stock_a]
+            (w**2) * cov_annual.loc[stock_a, stock_a]
             + ((1 - w) ** 2) * cov_annual.loc[stock_b, stock_b]
             + 2 * w * (1 - w) * cov_annual.loc[stock_a, stock_b]
         )
@@ -338,7 +374,9 @@ def make_portfolio_vol_chart(frontier: pd.DataFrame, stock_a: str, current_weigh
 # Sidebar inputs
 # ------------------------------------------------------------
 st.sidebar.header("Input Settings")
-default_end = date.today()
+
+# Use yesterday by default for more stable public deployment behavior
+default_end = date.today() - timedelta(days=1)
 default_start = default_end - timedelta(days=365 * 3)
 
 raw_ticker_input = st.sidebar.text_area(
@@ -385,12 +423,19 @@ if (end_date - start_date).days < MIN_DAYS:
 # Data load
 # ------------------------------------------------------------
 with st.spinner("Downloading market data and running analysis..."):
-    price_dict, failed_tickers, partial_tickers = download_price_data(tuple(selected_tickers), start_date, end_date)
+    price_dict, failed_tickers, partial_tickers = download_price_data(
+        tuple(selected_tickers),
+        start_date,
+        end_date,
+    )
 
 available_selected = [t for t in selected_tickers if t in price_dict]
 
 if failed_tickers:
-    st.error("These tickers failed to download or had insufficient data: " + ", ".join(failed_tickers))
+    st.error(
+        "These tickers failed to download or had insufficient data: "
+        + ", ".join(failed_tickers)
+    )
 
 if len(available_selected) < 2:
     st.error("Fewer than 2 valid stock tickers remain after validation. Please revise your inputs.")
@@ -416,11 +461,13 @@ summary_stats = compute_summary_stats(all_returns)
 # ------------------------------------------------------------
 # Tabs
 # ------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs([
-    "Price & Returns",
-    "Risk & Distribution",
-    "Correlation & Diversification",
-])
+tab1, tab2, tab3 = st.tabs(
+    [
+        "Price & Returns",
+        "Risk & Distribution",
+        "Correlation & Diversification",
+    ]
+)
 
 
 # ------------------------------------------------------------
@@ -551,7 +598,7 @@ with tab3:
         frontier_df, mean_returns_annual, cov_annual = build_two_asset_portfolio(stock_returns, port_a, port_b)
         current_return = weight_a * mean_returns_annual[port_a] + (1 - weight_a) * mean_returns_annual[port_b]
         current_variance = (
-            (weight_a ** 2) * cov_annual.loc[port_a, port_a]
+            (weight_a**2) * cov_annual.loc[port_a, port_a]
             + ((1 - weight_a) ** 2) * cov_annual.loc[port_b, port_b]
             + 2 * weight_a * (1 - weight_a) * cov_annual.loc[port_a, port_b]
         )
