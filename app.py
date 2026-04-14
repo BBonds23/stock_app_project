@@ -60,10 +60,6 @@ def download_single_ticker(ticker: str, start_date: date, end_date: date) -> pd.
 def download_price_data(tickers: tuple[str, ...], start_date: date, end_date: date):
     all_prices = {}
     failed = []
-    partial = []
-
-    # Allow a small buffer so weekends / market-close timing do not falsely trigger warnings
-    latest_expected = end_date - timedelta(days=3)
 
     for ticker in list(tickers) + [BENCHMARK]:
         try:
@@ -92,10 +88,19 @@ def download_price_data(tickers: tuple[str, ...], start_date: date, end_date: da
             failed.append(ticker)
             continue
 
-        if series.index.min().date() > start_date or series.index.max().date() < latest_expected:
-            partial.append(ticker)
-
         all_prices[ticker] = series
+
+    # Only flag tickers as partial if they are meaningfully missing data
+    partial = []
+    if all_prices:
+        combined = pd.concat(all_prices, axis=1).sort_index()
+        total_rows = len(combined)
+
+        if total_rows > 0:
+            for ticker in combined.columns:
+                missing_pct = combined[ticker].isna().mean()
+                if missing_pct > 0.05:
+                    partial.append(ticker)
 
     return all_prices, failed, partial
 
@@ -326,7 +331,7 @@ def build_two_asset_portfolio(stock_returns: pd.DataFrame, stock_a: str, stock_b
     for w in weights:
         portfolio_return = w * mean_returns_annual[stock_a] + (1 - w) * mean_returns_annual[stock_b]
         variance = (
-            (w**2) * cov_annual.loc[stock_a, stock_a]
+            (w ** 2) * cov_annual.loc[stock_a, stock_a]
             + ((1 - w) ** 2) * cov_annual.loc[stock_b, stock_b]
             + 2 * w * (1 - w) * cov_annual.loc[stock_a, stock_b]
         )
@@ -375,7 +380,6 @@ def make_portfolio_vol_chart(frontier: pd.DataFrame, stock_a: str, current_weigh
 # ------------------------------------------------------------
 st.sidebar.header("Input Settings")
 
-# Use yesterday by default for more stable public deployment behavior
 default_end = date.today() - timedelta(days=1)
 default_start = default_end - timedelta(days=365 * 3)
 
@@ -443,7 +447,7 @@ if len(available_selected) < 2:
 
 if partial_tickers:
     st.warning(
-        "Some tickers did not cover the full selected period and were aligned using the overlapping available range: "
+        "Some tickers had meaningful missing data and were aligned using the overlapping available range: "
         + ", ".join(partial_tickers)
     )
 
@@ -598,7 +602,7 @@ with tab3:
         frontier_df, mean_returns_annual, cov_annual = build_two_asset_portfolio(stock_returns, port_a, port_b)
         current_return = weight_a * mean_returns_annual[port_a] + (1 - weight_a) * mean_returns_annual[port_b]
         current_variance = (
-            (weight_a**2) * cov_annual.loc[port_a, port_a]
+            (weight_a ** 2) * cov_annual.loc[port_a, port_a]
             + ((1 - weight_a) ** 2) * cov_annual.loc[port_b, port_b]
             + 2 * weight_a * (1 - weight_a) * cov_annual.loc[port_a, port_b]
         )
